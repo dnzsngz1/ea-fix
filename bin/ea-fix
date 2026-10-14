@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""ea-fix - keep the EA app working for Steam games running under Proton on Linux.
+
+Fixes two failures seen with EA titles (Need for Speed, Battlefield, ...):
+  1. EA app downloads a mandatory client update, but EADestager.exe is never started
+     under Wine, so the EA app quits "to apply the update" on every launch (no error code).
+  2. After a game exit EA deletes its license; the next start can hang forever on
+     "Verifying rights" (license/auth-code request never returns).
+
+Commands:
+  ea-fix status               show detected Steam installs / EA prefixes / pending updates
+  ea-fix fix                  apply any staged EA app update now (all detected prefixes)
+  ea-fix install [--appid N]  add the self-healing wrapper to Steam launch options
+  ea-fix uninstall            remove the wrapper from Steam launch options
+  ea-fix launch -- %command%  (used by Steam) run the game with auto-repair + retry
+"""
+import argparse
+import glob
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+HOME = os.path.expanduser("~")
+EA_REL = os.path.join("drive_c", "Program Files", "Electronic Arts", "EA Desktop")
+MACHINE_REL = os.path.join("drive_c", "ProgramData", "EA Desktop", "machine.ini")
+LOGS_REL = os.path.join("drive_c", "ProgramData", "EA Desktop", "Logs")
+LOG_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "ea-fix.log")
+STALL_SECONDS = int(os.environ.get("EA_FIX_STALL_SECONDS", "90"))
+WRAP_MARK = "ea-fix launch --"
+
+
+def log(msg, echo=False):
+    line = "[%s] %s" % (time.strftime("%F %T"), msg)
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    if echo:
+        print(msg)
+
+
+# --------------------------------------------------------------------------- discovery
+def steam_roots():
+    cands = [
+        os.path.join(HOME, ".steam", "debian-installation"),
+        os.path.join(HOME, ".local", "share", "Steam"),
+        os.path.join(HOME, ".steam", "steam"),
+        os.path.join(HOME, ".var", "app", "com.valvesoftware.Steam", ".local", "share", "Steam"),
+    ]
+    seen, out = set(), []
+    for c in cands:
+        r = os.path.realpath(c)
+        if r not in seen and os.path.isdir(os.path.join(r, "steamapps")):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def library_steamapps(root):
+    libs = [os.path.join(root, "steamapps")]
+    vdf = os.path.join(root, "steamapps", "libraryfolders.vdf")
+    try:
+        with open(vdf, errors="replace") as f:
+            for m in re.finditer(r'"path"\s+"([^"]+)"', f.read()):
+                p = os.path.join(m.group(1).replace("\\\\", "\\"), "steamapps")
+                if os.path.isdir(p) and os.path.realpath(p) not in [os.path.realpath(x) for x in libs]:
+                    libs.append(p)
+    except OSError:
+        pass
+    return libs
+
+
+class Prefix:
+    def __init__(self, root, compat_dir):
+        self.root = root
+        self.compat = compat_dir
+        self.appid = os.path.basename(compat_dir)
+        self.pfx = os.path.join(compat_dir, "pfx")
+        self.ea_dir = os.path.join(self.pfx, EA_REL)
+        self.machine = os.path.join(self.pfx, MACHINE_REL)
+        self.logs = os.path.join(self.pfx, LOGS_REL)
+        self.flatpak = "com.valvesoftware.Steam" in root
+
+    @property
+    def update_pending(self):
+        try:
+            with open(self.machine, errors="replace") as f:
+                return re.search(r"^machine\.updatepending=1", f.read(), re.M) is not None
+        except OSError:
+            return False
+
+    def staged_destager(self):
+        c = glob.glob(os.path.join(self.ea_dir, "[0-9]*.*-[0-9]*", "Destager", "EADestager.exe"))
+        c.sort(key=os.path.getmtime, reverse=True)
+        return c[0] if c else None
+
+    def proton(self):
+        return find_proton(self.root, self.compat)
+
+    def env(self):
+        e = dict(os.environ)
+        e["STEAM_COMPAT_DATA_PATH"] = self.compat
+        e["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = self.root
+        return e
+
+
+def find_proton(root, compat):
+    names = []
+    try:
+        with open(os.path.join(compat, "config_info")) as f:
+            first = f.readline().strip()
+            if first:
+                names.append(first)
+    except OSError:
+        pass
+    dirs = [os.path.join(root, "compatibilitytools.d"), "/usr/share/steam/compatibilitytools.d"]
+    for lib in library_steamapps(root):
+        dirs.append(os.path.join(lib, "common"))
+    for n in names:
+        for d in dirs:
+            for cand in glob.glob(os.path.join(d, n + "*", "proton")) + [os.path.join(d, n, "proton")]:
+                if os.path.isfile(cand):
+                    return cand
+    # fallback: newest Proton found anywhere
+    found = []
+    for d in dirs:
+        found += glob.glob(os.path.join(d, "*", "proton"))
+    found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return found[0] if found else None
+
+
+def find_prefixes():
+    out = []
+    for root in steam_roots():
+        for lib in library_steamapps(root):
+            for compat in glob.glob(os.path.join(lib, "compatdata", "*")):
+                if os.path.isdir(os.path.join(compat, "pfx", EA_REL)):
+                    out.append(Prefix(root, compat))
+    return out
+
+
+def prefix_from_env():
+    p = os.environ.get("STEAM_COMPAT_DATA_PATH")
+    root = os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH")
+    if p and root and os.path.isdir(os.path.join(p, "pfx", EA_REL)):
+        return Prefix(root, p)
+    return None
+
+
+# --------------------------------------------------------------------------- actions
+def proton_run(px, proton, *args, timeout=180):
+    if not proton:
+        log("no Proton runtime found for prefix %s" % px.compat)
+        return 1
+    with open(LOG_FILE, "a") as lf:
+        try:
+            return subprocess.run([proton, "run", *args], env=px.env(), stdout=lf, stderr=lf,
+                                  timeout=timeout).returncode
+        except subprocess.TimeoutExpired:
+            return 124
+
+
+def kill_prefix_processes(px, proton=None):
+    proton = proton or px.proton()
+    proton_run(px, proton, "wineboot", "-k", timeout=45)
+    time.sleep(3)
+
+
+def apply_update(px, proton=None, echo=False):
+    exe = px.staged_destager()
+    if not exe:
+        log("prefix %s: update pending but no staged destager found" % px.appid, echo)
+        return False
+    rel = os.path.relpath(exe, os.path.join(px.pfx, "drive_c")).replace("/", "\\")
+    proton = proton or px.proton()
+    log("prefix %s: applying staged EA app update (%s)" % (px.appid, rel), echo)
+    kill_prefix_processes(px, proton)
+    proton_run(px, proton, "C:\\" + rel)
+    time.sleep(5)
+    kill_prefix_processes(px, proton)
+    ok = not px.update_pending
+    log("prefix %s: update %s" % (px.appid, "applied" if ok else "STILL pending"), echo)
+    return ok
+
+
+def launch_stalled(px, since_size):
+    """True when the SteamLauncher log shows a launch started but the game never spawned."""
+    path = os.path.join(px.logs, "EASteamLauncher.log")
+    try:
+        with open(path, "rb") as f:
+            f.seek(since_size)
+            txt = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    started = "Received game launch progress" in txt or "launch game request" in txt
+    spawned = "Game process resumed" in txt or "Game process created" in txt
+    return started and not spawned
+
+
+def log_size(px):
+    try:
+        return os.path.getsize(os.path.join(px.logs, "EASteamLauncher.log"))
+    except OSError:
+        return 0
+
+
+def run_game(cmd, px):
+    """Run the game; return (rc, stalled). Kill the prefix if 'verifying rights' hangs."""
+    start = log_size(px) if px else 0
+    proc = subprocess.Popen(cmd)
+    stall_since = None
+    while proc.poll() is None:
+        time.sleep(5)
+        if px and launch_stalled(px, start):
+            stall_since = stall_since or time.time()
+            if time.time() - stall_since > STALL_SECONDS:
+                log("launch stalled >%ds (license/auth request hang); resetting EA processes" % STALL_SECONDS)
+                kill_prefix_processes(px, cmd[0] if os.path.basename(cmd[0]) == "proton" else None)
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.send_signal(signal.SIGTERM)
+                return 1, True
+        else:
+            stall_since = None
+    return proc.returncode, False
+
+
+def cmd_launch(args):
+    cmd = args.command
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        print("usage: ea-fix launch -- %command%", file=sys.stderr)
+        return 2
+    px = prefix_from_env()
+    if not px:
+        log("not an EA prefix; running command untouched")
+        os.execvp(cmd[0], cmd)
+    proton = cmd[0] if os.path.basename(cmd[0]) == "proton" else None
+    if px.update_pending:
+        apply_update(px, proton)
+    rc, stalled = run_game(cmd, px)
+    if stalled:
+        log("retrying launch after stall")
+        rc, stalled = run_game(cmd, px)
+    elif px.update_pending:
+        log("update became pending during launch (rc=%s); applying and relaunching once" % rc)
+        if apply_update(px, proton):
+            rc, _ = run_game(cmd, px)
+    return rc
+
+
+def cmd_status(args):
+    roots = steam_roots()
+    if not roots:
+        print("No Steam installation found.")
+        return 1
+    for r in roots:
+        print("Steam: %s%s" % (r, "  (Flatpak - limited support)" if "com.valvesoftware.Steam" in r else ""))
+    pfx = find_prefixes()
+    if not pfx:
+        print("No Proton prefixes with the EA app found.")
+    for px in pfx:
+        print("\nAppID %s" % px.appid)
+        print("  prefix        : %s" % px.compat)
+        print("  proton        : %s" % (px.proton() or "NOT FOUND"))
+        print("  update pending: %s" % ("YES" if px.update_pending else "no"))
+        print("  staged update : %s" % (px.staged_destager() or "none"))
+    return 0
+
+
+def cmd_fix(args):
+    pfx = find_prefixes()
+    if not pfx:
+        print("No EA app prefixes found.")
+        return 1
+    if subprocess.run(["pgrep", "-x", "steam"], capture_output=True).returncode == 0 and not args.force:
+        pass  # fine, the wine prefix is separate from Steam itself
+    rc = 0
+    for px in pfx:
+        if px.update_pending or args.force:
+            if not apply_update(px, echo=True):
+                rc = 1
+        else:
+            print("AppID %s: nothing to do" % px.appid)
+    return rc
+
+
+# --------------------------------------------------------------------------- VDF editing
+def vdf_parse(text):
+    tok = re.compile(r'"((?:[^"\\]|\\.)*)"|([{}])')
+    pos, stack = 0, []
+    root = []
+    cur = root
+    key = None
+    for m in tok.finditer(text):
+        if m.group(2) == "{":
+            node = []
+            cur.append((key, node))
+            stack.append(cur)
+            cur, key = node, None
+        elif m.group(2) == "}":
+            cur = stack.pop()
+            key = None
+        else:
+            s = m.group(1)
+            if key is None:
+                key = s
+            else:
+                cur.append((key, s))
+                key = None
+    return root
+
+
+def vdf_dump(nodes, depth=0):
+    out = []
+    t = "\t" * depth
+    for k, v in nodes:
+        if isinstance(v, list):
+            out.append('%s"%s"\n%s{\n%s%s}\n' % (t, k, t, vdf_dump(v, depth + 1), t))
+        else:
+            out.append('%s"%s"\t\t"%s"\n' % (t, k, v))
+    return "".join(out)
+
+
+def find_path(nodes, path):
+    cur = nodes
+    for p in path:
+        nxt = None
+        for k, v in cur:
+            if k.lower() == p.lower() and isinstance(v, list):
+                nxt = v
+                break
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur
+
+
+def set_launch_option(nodes, appid, wrapper_cmd, remove):
+    apps = find_path(nodes, ["UserLocalConfigStore", "Software", "Valve", "Steam", "apps"])
+    if apps is None:
+        apps = find_path(nodes, ["UserLocalConfigStore", "Software", "valve", "steam", "apps"])
+    if apps is None:
+        return None
+    blk = None
+    for k, v in apps:
+        if k == appid and isinstance(v, list):
+            blk = v
+    if blk is None:
+        if remove:
+            return ""
+        blk = []
+        apps.append((appid, blk))
+    cur = ""
+    idx = None
+    for i, (k, v) in enumerate(blk):
+        if k == "LaunchOptions" and not isinstance(v, list):
+            cur, idx = v, i
+    # always drop previous wrapper variants (incl. the old hand-made nfs-ea-launch)
+    new = re.sub(r"\S*nfs-ea-launch\s*", "", cur)
+    new = re.sub(r"\S*ea-fix launch --\s*", "", new)
+    if not remove:
+        if "%command%" in new:
+            new = new.replace("%command%", "%s %%command%%" % wrapper_cmd, 1)
+        else:
+            new = (new + " " if new else "") + "%s %%command%%" % wrapper_cmd
+    new = new.strip()
+    if new == "%command%":
+        new = ""
+    if idx is None:
+        blk.append(("LaunchOptions", new))
+    else:
+        blk[idx] = ("LaunchOptions", new)
+    return new
+
+
+def localconfigs():
+    out = []
+    for r in steam_roots():
+        out += glob.glob(os.path.join(r, "userdata", "*", "config", "localconfig.vdf"))
+    return out
+
+
+def cmd_install(args, remove=False):
+    me = os.path.realpath(sys.argv[0])
+    in_path = shutil.which("ea-fix")
+    if in_path or os.path.exists("/usr/bin/ea-fix") or os.path.exists("/usr/local/bin/ea-fix"):
+        wrapper = "ea-fix launch --"
+    else:
+        wrapper = "%s launch --" % me
+
+    pfx = find_prefixes()
+    appids = [args.appid] if getattr(args, "appid", None) else [p.appid for p in pfx]
+    if not appids:
+        print("No EA app prefixes found. Launch the game once through Steam first, or use --appid N.")
+        return 1
+    if subprocess.run(["pgrep", "-x", "steam"], capture_output=True).returncode == 0:
+        if args.stop_steam:
+            print("Stopping Steam...")
+            subprocess.run(["steam", "-shutdown"], capture_output=True)
+            for _ in range(40):
+                if subprocess.run(["pgrep", "-x", "steam"], capture_output=True).returncode != 0:
+                    break
+                time.sleep(1)
+        elif not args.dry_run:
+            print("Steam is running and would overwrite the change. Close Steam, or re-run with --stop-steam.")
+            return 1
+    files = localconfigs()
+    if not files:
+        print("No localconfig.vdf found (log in to Steam once first).")
+        return 1
+    for f in files:
+        with open(f, errors="replace") as fh:
+            text = fh.read()
+        nodes = vdf_parse(text)
+        for a in appids:
+            res = set_launch_option(nodes, a, wrapper, remove)
+            if res is None:
+                print("%s: unexpected format, skipped" % f)
+                break
+            print("AppID %s launch options -> %r" % (a, res))
+        else:
+            if args.dry_run:
+                continue
+            shutil.copy2(f, f + ".ea-fix.bak")
+            with open(f, "w") as fh:
+                fh.write(vdf_dump(nodes))
+            print("updated %s (backup: %s.ea-fix.bak)" % (f, f))
+    if args.stop_steam and not args.dry_run and not args.no_restart:
+        subprocess.Popen(["steam", "-silent"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ea-fix", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    f = sub.add_parser("fix")
+    f.add_argument("--force", action="store_true", help="re-apply even if no update is flagged pending")
+    for name in ("install", "uninstall"):
+        p = sub.add_parser(name)
+        p.add_argument("--appid", help="only this Steam AppID (default: every detected EA prefix)")
+        p.add_argument("--stop-steam", action="store_true", help="close Steam first and restart it after")
+        p.add_argument("--no-restart", action="store_true")
+        p.add_argument("--dry-run", action="store_true")
+    l = sub.add_parser("launch")
+    l.add_argument("command", nargs=argparse.REMAINDER)
+    args = ap.parse_args()
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "fix":
+        return cmd_fix(args)
+    if args.cmd == "install":
+        return cmd_install(args)
+    if args.cmd == "uninstall":
+        return cmd_install(args, remove=True)
+    return cmd_launch(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
