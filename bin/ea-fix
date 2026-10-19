@@ -247,15 +247,9 @@ def cmd_launch(args):
     proton = cmd[0] if os.path.basename(cmd[0]) == "proton" else None
     if px.update_pending:
         apply_update(px, proton)
-    rc, stalled = run_game(cmd, px)
-    if stalled:
-        log("retrying launch after stall")
-        rc, stalled = run_game(cmd, px)
-    elif px.update_pending:
-        log("update became pending during launch (rc=%s); applying and relaunching once" % rc)
-        if apply_update(px, proton):
-            rc, _ = run_game(cmd, px)
-    return rc
+    log("executing game command via execvp")
+    os.execvp(cmd[0], cmd)
+
 
 
 def cmd_status(args):
